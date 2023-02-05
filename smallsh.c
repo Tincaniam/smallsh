@@ -26,13 +26,67 @@ char *token_array[MAX_LINE] = {NULL};
 char in_file_name[256] = {0};
 char out_file_name[256] = {0};
 
+// Initialize SIGINT_action struct to be empty
+struct sigaction SIGINT_action = {0}, ignore_action = {0}, old_sigstp_action, old_sigint_action;
 static sigjmp_buf env;
 static volatile sig_atomic_t jump_bool = false; // make sure this can be accessed by signal handler
 
 /* signal handler for SIGINT, taken from Exploration: Signal Handling API */
-void handle_SIGINT_JUMP(int signo){
+void handle_SIGINT_JUMP(){
     if (jump_bool == false) return;
     siglongjmp(env, 1);
+}
+
+// Function prototypes
+static int GetCommands(char *line, size_t len);
+static int ParseCommands();
+static int ExecuteCommands();
+static int ManageBackgroundProcesses();
+char *str_gsub(char *restrict *restrict haystack, char const *restrict needle, char const *restrict sub);
+
+/*******************************************************************************
+ * Main function
+ ********************************************************************************/
+int main(void) {
+    // Register the ignore_action as the handler for SIGTSTP, and SIGINT.
+    // So both of these signals will be ignored.
+    sigaction(SIGTSTP, &ignore_action, NULL);
+    sigaction(SIGINT, &ignore_action, NULL);
+
+    // Declare line pointer outside of loop to avoid memory leak
+    char *line = NULL;
+    size_t len = 0;
+    // Enter the main loop, only exit if the user types "exit".
+    for (;;) {
+        // Clean up
+        getcmd:
+//        for (int i = 0; i < MAX_LINE; i++) {
+//            cmd_array[i] = NULL;
+//            free(cmd_array[i]);
+//        }
+//        for (int i = 0; i < 256; i++) {
+//            in_file_name[i] = NULL;
+//            out_file_name[i] = NULL;
+//            free(in_file_name[i]);
+//            free(out_file_name[i]);
+//        }
+        is_background = 0;
+        memset(token_array, 0, 512);
+        memset(in_file_name, 0, 256);
+        memset(out_file_name, 0, 256);
+
+        set_infile = 0; set_outfile = 0;
+        line_count = 0;
+        err_status = 0;
+
+        GetCommands(line, len);
+        if (token_array[0] == NULL){ // no command word
+            // Go back to get command
+            goto getcmd;
+        }
+        ParseCommands();
+        ExecuteCommands();
+    }
 }
 
 /*****************************************************************
@@ -81,9 +135,7 @@ char *str_gsub(char *restrict *restrict haystack, char const *restrict needle, c
  * @param token_array: array of tokens
  * @return: 0 if successful, -1 if error
  *********************************************************************/
-static int GetCommands() {
-    // Initialize SIGINT_action struct to be empty
-    struct sigaction SIGINT_action = {0}, ignore_action = {0};
+static int GetCommands(char *line, size_t len) {
     ignore_action.sa_handler = SIG_IGN;
     // Fill out the SIGINT_action struct
     // Register handle_SIGINT as the signal handler
@@ -112,34 +164,17 @@ static int GetCommands() {
     *  Before printing a prompt message, smallsh shall check for any
     *  un-waited-for background processes in the same process group ID as
     *  smallsh, and prints informative message to stderr for each*/
+    ManageBackgroundProcesses();
+
     const char *ps1 = getenv("PS1");
     if (ps1 == NULL) ps1 = "";
 
-    int child_status;
-    pid_t my_pid = getpid();
-    pid_t child_pid = waitpid(-my_pid, &child_status, WNOHANG); // Get any child with same group PID as smallsh.
-
-    while (child_pid > 0) {
-        if (WIFEXITED(child_status)) {
-            if (fprintf(stderr, "Child process %jd done. Exit status %d\n", (intmax_t) child_pid,
-                        WEXITSTATUS(child_status)) < 0) goto exit;
-        } else if (WIFSIGNALED(child_status)) {
-            if (fprintf(stderr, "Child process %jd done. Terminated by signal %d\n", (intmax_t) child_pid,
-                        WTERMSIG(child_status)) < 0) goto exit;
-        } else if (WIFSTOPPED(child_status)) {
-            if (kill(child_pid, SIGCONT) < 0) goto exit;
-            if (fprintf(stderr, "Child process %jd stopped. Continuing.\n", (intmax_t) child_pid)) goto exit;
-        }
-        child_pid = waitpid(-my_pid, &child_status, 0);
-    }
     // Print prompt message
     if (printf("%s", ps1) < 0) goto exit;
     fflush(stdout);
 
     // Get user input
-    char *line = NULL;
-    size_t n = 0;
-    ssize_t line_length = getline(&line, &n, stdin); /* Reallocates line */
+    ssize_t line_length = getline(&line, &len, stdin); /* Reallocates line */
 
     sigaction(SIGINT, &ignore_action, NULL); // ignore SIGINT again
 
@@ -173,55 +208,35 @@ static int GetCommands() {
         // Check each token for variable expansion
         int k = 0;
         while (token_array[k] != NULL && strcmp(token_array[k], "#") != 0) {
-            // For every token, go through the expansion process 2 chars at a time
-            int j = 0;
-            while (k < i && j < strlen(token_array[k]) - 1) {
-                get_new_chars:; // Label for goto
-                if (k >= i) goto exit;
-                char *two_chars = malloc(3);
-                memset(two_chars, 0, 3);
-                two_chars[0] = token_array[k][j]; two_chars[1] = token_array[k][j + 1];
-                // Expand ~ to home directory
-                if (strcmp(two_chars, "~/") == 0) {
-                    char *home = getenv("HOME");
-                    str_gsub(&token_array[k], "~", home);
-                    j = 0;
-                    k++;
-                    goto get_new_chars;
-                }
-                    // Expand $$ to PID of smallsh
-                else if (strcmp(two_chars, "$$") == 0) {
-                    pid_t pid = getpid();
-                    char *str_pid = malloc(21);
-                    if (sprintf(str_pid, "%jd", (intmax_t) pid) < 0) goto exit;
-                    str_gsub(&token_array[k], "$$", str_pid);
-                    j = 0;
-                    k++;
-                    goto get_new_chars;
-                }
-                    // Expand $? to exit status of last foreground command
-                    // The $? parameter shall default to 0 (“0”).
-                else if (strcmp(two_chars, "$?") == 0) {
-                    char *dollar_question_str = malloc(11);
-                    if (sprintf(dollar_question_str, "%d", dollar_question) < 0) goto exit;
-                    str_gsub(&token_array[k], "$?", dollar_question_str);
-                    j = 0;
-                    k++;
-                    goto get_new_chars;
-                }
-                    //Expand $! to PID of most recent background process
-                    // The $! parameter shall default to an empty string (““).
-                else if (strcmp(two_chars, "$!") == 0) {
-                    str_gsub(&token_array[k], "$!", dollar_exclamation);
-                    j = 0;
-                    k++;
-                    goto get_new_chars;
-                }
-                else {
-                    j++;
-                    free(two_chars);
-                }
-            } k++;
+            // get 2 first chars of token to compare for expansion
+            char *first_chars = malloc(3);
+            memset(first_chars, 0, 3);
+            first_chars[0] = token_array[k][0]; first_chars[1] = token_array[k][1];
+            // Expand ~ to home directory
+            if (strcmp(first_chars, "~/") == 0) {
+                char *home = getenv("HOME");
+                str_gsub(&token_array[k], "~", home);
+            }
+
+            // Expand $$ to PID of smallsh
+            pid_t pid = getpid();
+            char *str_pid = malloc(21);
+            if (sprintf(str_pid, "%jd", (intmax_t) pid) < 0) goto exit;
+            str_gsub(&token_array[k], "$$", str_pid);
+            free(str_pid);
+
+            // Expand $? to exit status of last foreground command
+            // The $? parameter shall default to 0 (“0”).
+            char *dollar_question_str = malloc(11);
+            if (sprintf(dollar_question_str, "%d", dollar_question) < 0) goto exit;
+            str_gsub(&token_array[k], "$?", dollar_question_str);
+            free(dollar_question_str);
+
+            //Expand $! to PID of most recent background process
+            // The $! parameter shall default to an empty string (““) if no background process ID is available.
+            str_gsub(&token_array[k], "$!", dollar_exclamation);
+
+            k++;
         }
     } exit:
     return errno ? -1 : 0;
@@ -236,7 +251,6 @@ static int GetCommands() {
  * @return 0 if successful, -1 if error
  ********************************************************************************/
 static int ParseCommands(){
-    struct sigaction ignore_action = {0};
     sigaction(SIGTSTP, &ignore_action, NULL); // ignore SIGTSTP
     sigaction(SIGINT, &ignore_action, NULL); // ignore SIGINT
 
@@ -293,7 +307,6 @@ static int ParseCommands(){
  * @return 0 if successful, -1 if error
  ********************************************************************************/
 static int ExecuteCommands(){
-    struct sigaction ignore_action = {0}, old_sigstp_action, old_sigint_action;
     sigaction(SIGTSTP, &ignore_action, &old_sigstp_action); // ignore SIGTSTP
     sigaction(SIGINT, &ignore_action, &old_sigint_action); // ignore SIGINT
 
@@ -377,18 +390,18 @@ static int ExecuteCommands(){
                 // File input
                 if (set_infile == 1){
                     // Open source file
-                    int source_file = open(in_file_name, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+                    int source_file = open(in_file_name, O_RDONLY);
                     if (source_file == -1){
                         fprintf(stderr, "open() failed on \"%s\"\n", in_file_name);
                         exit(-1);
                     }
                     // Redirect stdin to source file
-                    int result = dup2(source_file , 1);
+                    int result = dup2(source_file , 0);
                     if (result == -1) {
                         perror("source dup2()");
                         exit(-1);
                     }
-                    // Close source file
+                    //Close source file
                     fcntl(source_file, F_SETFD, FD_CLOEXEC);
                 }
 
@@ -408,22 +421,20 @@ static int ExecuteCommands(){
                     }
                 }
                 // Replace the current process image with a new process image
-                printf("token_array[0]: %s", token_array[0]);
                 execvp(token_array[0], token_array);
 
-                // Check for "/" in first character of command
-//                char first_char [1] = {};
-//                first_char[0] = token_array[0][0];
-////                if (strcmp(first_char, "/") != 0){
-////                    // Search for command in PATH
-////                    execvp(token_array[0], token_array);
-////                }
-////                else{
-////                    // Search for command in current directory
-////                    // Search for command in PATH
-////                    execv(token_array[0], token_array);
-////
-////                }
+                //Check for "/" in first character of command
+                char first_char[1] = {};
+                first_char[0] = token_array[0][0];
+                if (strcmp(first_char, "/") != 0){
+                    // Search for command in PATH
+                    execvp(token_array[0], token_array);
+                }
+                else{
+                    // Search for command in current directory
+                    // Search for command in PATH
+                    execv(token_array[0], token_array);
+                }
                 // exec only returns if there is an error
                 perror("execve");
                 exit(-1);
@@ -433,26 +444,22 @@ static int ExecuteCommands(){
                 if (is_background == 0){
                     // Wait for child process to terminate
                     spawn_pid = waitpid(spawn_pid, &child_status, WUNTRACED);
+                    dollar_question = child_status;
                     if (WIFEXITED(child_status)){
                         dollar_question = WEXITSTATUS(child_status);
                     }
-                        // If child process was terminated by a signal, set $? to 128 + signal number
+                    // If child process was terminated by a signal, set $? to 128 + signal number
                     else if (WIFSIGNALED(child_status)){
                         dollar_question = 128 + WTERMSIG(child_status);
                     }
-                        // If child process was stopped by a signal, send SIGCONT to child process
-                        // set $! to child process ID. Print message to stderr.
+                    // If child process was stopped by a signal, send SIGCONT to child process
+                    // set $! to child process ID. Print message to stderr.
                     else if (WIFSTOPPED(child_status)) {
                         if (kill(spawn_pid, SIGCONT) < 0) goto exit;
                         if (fprintf(stderr, "Child process %jd stopped. Continuing.\n", (intmax_t) spawn_pid) < 0) goto exit;
-                        //dollar_exclamation = malloc(21);
-                        //if (sprintf(dollar_exclamation, "%jd", (intmax_t) spawn_pid) < 0) goto exit;
+                        dollar_exclamation = malloc(21);
+                        if (sprintf(dollar_exclamation, "%jd", (intmax_t) spawn_pid) < 0) goto exit;
                         goto background_process;
-
-                    }
-                    else {
-                        // Set $? to child process exit status
-                        dollar_question = child_status;
                     }
                     goto exit;
                 }
@@ -470,53 +477,23 @@ static int ExecuteCommands(){
     return err_status;
 }
 
-/*******************************************************************************
- * Main function
- ********************************************************************************/
-int main(void) {
-
-    struct sigaction ignore_action = {0};
-    // Register the ignore_action as the handler for SIGTSTP, and SIGINT.
-    // So both of these signals will be ignored.
-    sigaction(SIGTSTP, &ignore_action, NULL);
-    sigaction(SIGINT, &ignore_action, NULL);
-
-    // Enter the main loop, only exit if the user types "exit".
-    for (;;) {
-        // Clean up
-        getcmd:
-//        for (int i = 0; i < MAX_LINE; i++) {
-//            cmd_array[i] = NULL;
-//            free(cmd_array[i]);
-//        }
-//        for (int i = 0; i < 256; i++) {
-//            in_file_name[i] = NULL;
-//            out_file_name[i] = NULL;
-//            free(in_file_name[i]);
-//            free(out_file_name[i]);
-//        }
-        is_background = 0;
-        memset(token_array, 0, 512);
-        memset(in_file_name, 0, 256);
-        memset(out_file_name, 0, 256);
-
-        set_infile = 0; set_outfile = 0;
-        line_count = 0;
-        err_status = 0;
-
-        GetCommands();
-        if (token_array[0] == NULL){ // no command word
-            // Go back to get command
-            goto getcmd;
+static int ManageBackgroundProcesses(){
+    int child_status;
+    pid_t my_pid = getpid();
+    pid_t child_pid = waitpid(-my_pid, &child_status, WNOHANG); // Get any child with same group PID as smallsh.
+    while (child_pid > 0) {
+        if (WIFEXITED(child_status)) {
+            if (fprintf(stderr, "Child process %jd done. Exit status %d\n", (intmax_t) child_pid,
+                        WEXITSTATUS(child_status)) < 0) goto exit;
+        } else if (WIFSIGNALED(child_status)) {
+            if (fprintf(stderr, "Child process %jd done. Terminated by signal %d\n", (intmax_t) child_pid,
+                        WTERMSIG(child_status)) < 0) goto exit;
+        } else if (WIFSTOPPED(child_status)) {
+            if (kill(child_pid, SIGCONT) < 0) goto exit;
+            if (fprintf(stderr, "Child process %jd stopped. Continuing.\n", (intmax_t) child_pid)) goto exit;
         }
-        ParseCommands();
-        ExecuteCommands();
-//        int i = 0;
-//        while (cmd_array[i] != NULL) {
-//            printf("%s\n", cmd_array[i]);
-//            i++;
-//        }
-//       break;
-    } exit:
+        child_pid = waitpid(-my_pid, &child_status, 0);
+    }
+    exit:
     return errno ? -1 : 0;
 }
