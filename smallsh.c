@@ -1,3 +1,13 @@
+/*********************************************************************
+ * Name: smallsh.c
+ * Author: Matthew Tinnel
+ * Date: 02/05/2023
+ * Description:
+ *      A small shell program with built-in commands: exit, and cd.
+ *      Also supports non-built-in commands, input/output redirection,
+ *      comments, background processes, and variable expansion.
+ *********************************************************************/
+
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <stdio.h>
@@ -42,16 +52,13 @@ static int GetCommands(char *line, size_t len);
 static int ParseCommands();
 static int ExecuteCommands();
 static int ManageBackgroundProcesses();
+int KillChildrenProcesses(pid_t parent_pid, int signal);
 char *str_gsub(char *restrict *restrict haystack, char const *restrict needle, char const *restrict sub);
 
 /*******************************************************************************
  * Main function
  ********************************************************************************/
 int main(void) {
-    // Register the ignore_action as the handler for SIGTSTP, and SIGINT.
-    // So both of these signals will be ignored.
-    sigaction(SIGTSTP, &ignore_action, NULL);
-    sigaction(SIGINT, &ignore_action, NULL);
 
     // Declare line pointer outside of loop to avoid memory leak
     char *line = NULL;
@@ -60,16 +67,6 @@ int main(void) {
     for (;;) {
         // Clean up
         getcmd:
-//        for (int i = 0; i < MAX_LINE; i++) {
-//            cmd_array[i] = NULL;
-//            free(cmd_array[i]);
-//        }
-//        for (int i = 0; i < 256; i++) {
-//            in_file_name[i] = NULL;
-//            out_file_name[i] = NULL;
-//            free(in_file_name[i]);
-//            free(out_file_name[i]);
-//        }
         is_background = 0;
         memset(token_array, 0, 512);
         memset(in_file_name, 0, 256);
@@ -80,14 +77,17 @@ int main(void) {
         err_status = 0;
 
         GetCommands(line, len);
+        if (feof(stdin)) goto exit;
         if (token_array[0] == NULL){ // no command word
             // Go back to get command
             goto getcmd;
         }
         ParseCommands();
         ExecuteCommands();
-    }
+    } exit:
+    exit(dollar_question);
 }
+
 
 /*****************************************************************
  * char *str_gsub
@@ -131,8 +131,10 @@ char *str_gsub(char *restrict *restrict haystack, char const *restrict needle, c
 
 /*********************************************************************
  * GetCommands
- * Print prompt message, get user input, parse it into tokens, and expand variables.
- * @param token_array: array of tokens
+ * Print prompt message, get user input, parse it into tokens,
+ * and expand variables.
+ * @param char* line
+ * @param size_t len
  * @return: 0 if successful, -1 if error
  *********************************************************************/
 static int GetCommands(char *line, size_t len) {
@@ -175,8 +177,10 @@ static int GetCommands(char *line, size_t len) {
 
     // Get user input
     ssize_t line_length = getline(&line, &len, stdin); /* Reallocates line */
-
-    sigaction(SIGINT, &ignore_action, NULL); // ignore SIGINT again
+    if (feof(stdin)){
+        fprintf(stderr, "\nexit\n");
+        exit(dollar_question);
+    }
 
     if (line_length == 1) goto exit; // no command word
     if (line_length > MAX_LINE) {
@@ -186,9 +190,8 @@ static int GetCommands(char *line, size_t len) {
     if (line_length == -1) {
         clearerr(stdin); // reset stdin status due to interrupt
         goto jump_point;
-
     }
-        // Process user input
+    // Process user input
     else {
         char *token;
         int i = 0;
@@ -244,15 +247,10 @@ static int GetCommands(char *line, size_t len) {
 
 /*******************************************************************************
  * ParseCommands
- * Parse the commands passed in and handle redirection and background processes
- * @param token_array
- * @param in_file_name
- * @param out_file_name
+ * Parse the commands in token_array and handle redirection and background processes
  * @return 0 if successful, -1 if error
  ********************************************************************************/
 static int ParseCommands(){
-    sigaction(SIGTSTP, &ignore_action, NULL); // ignore SIGTSTP
-    sigaction(SIGINT, &ignore_action, NULL); // ignore SIGINT
 
     if (token_array[0] == NULL) goto exit;
     ssize_t i = line_count; // i is the index of the last valid token
@@ -298,23 +296,21 @@ static int ParseCommands(){
     return errno ? -1 : 0;
 }
 
-/*******************************************************************************
+/*********************************************************************
  * ExecuteCommands
- * Execute the commands passed in. This function will fork and exec the commands.
- * @param token_array
- * @param in_file_name
- * @param out_file_name
- * @return 0 if successful, -1 if error
- ********************************************************************************/
+ * Execute the commands stored in token_array.
+ * Includes built-in commands: exit and cd.
+ * Supports non-built in commands, and background processes.
+ * Handles redirection.
+ * @return: 0 if successful, -1 if error
+ *********************************************************************/
 static int ExecuteCommands(){
-    sigaction(SIGTSTP, &ignore_action, &old_sigstp_action); // ignore SIGTSTP
-    sigaction(SIGINT, &ignore_action, &old_sigint_action); // ignore SIGINT
 
     if (token_array[0] == NULL) goto exit;
 
     int child_status;
     pid_t my_pid = getpid();
-    pid_t child_pid = waitpid(-my_pid, &child_status, WNOHANG); // Get any child with same group PID as smallsh.
+    pid_t child_pid = waitpid(-my_pid, &child_status, WNOHANG | WUNTRACED); // Get any child with same group PID as smallsh.
 
     // Built in commands
 
@@ -329,12 +325,9 @@ static int ExecuteCommands(){
             long exit_status = strtol(token_array[1], NULL, 10);
             if (exit_status > -256 && exit_status < 256){ // exit argument is an int
                 fprintf(stderr, "\nexit\n");
-                if (child_pid > 0) {
-                    if (kill(0, SIGINT) < 0) exit(1);
-                }
+                KillChildrenProcesses(my_pid, SIGINT);
                 err_status = (int) exit_status;
                 exit(err_status);
-                //exit(1);
             }
             else { // exit argument is not an int
                 fprintf(stderr, "exit: argument not an int\n");
@@ -344,11 +337,8 @@ static int ExecuteCommands(){
         }
         else { // no exit argument, exit with status of last foreground command
             fprintf(stderr, "\nexit\n");
-            if (child_pid > 0) {
-                if (kill(0, SIGINT) < 0) exit(1);
-            }
+            KillChildrenProcesses(my_pid, SIGINT);
             exit(dollar_question);
-            //exit(1);
         }
     }
 
@@ -368,7 +358,7 @@ static int ExecuteCommands(){
         goto exit;
     }
 
-        // Non-Built-in commands
+    // Non-Built-in commands
     else{
         // Using exec() with fork(), taken from Exploration: Process API - Executing a New Program
 
@@ -382,7 +372,7 @@ static int ExecuteCommands(){
             case 0:
                 // This runs in the child process.
 
-                // All signals shall be reset to their original dispositions when smallsh was invoked.
+                // All signals shall be reset to their original actions when smallsh was invoked.
                 sigaction(SIGTSTP, &old_sigstp_action, NULL);
                 sigaction(SIGINT, &old_sigint_action, NULL);
 
@@ -450,6 +440,7 @@ static int ExecuteCommands(){
                     }
                     // If child process was terminated by a signal, set $? to 128 + signal number
                     else if (WIFSIGNALED(child_status)){
+                        //fprintf(stderr, "terminated by signal %d\n", WTERMSIG(child_status));
                         dollar_question = 128 + WTERMSIG(child_status);
                     }
                     // If child process was stopped by a signal, send SIGCONT to child process
@@ -465,7 +456,6 @@ static int ExecuteCommands(){
                 }
                 else {
                     background_process:
-                    // Add to background process list
                     waitpid(spawn_pid, &child_status, WNOHANG);
                     dollar_exclamation = malloc(21);
                     if (sprintf(dollar_exclamation, "%jd", (intmax_t) spawn_pid) < 0) goto exit;
@@ -477,22 +467,51 @@ static int ExecuteCommands(){
     return err_status;
 }
 
+/*********************************************************************
+ * ManageBackgroundProcesses()
+ * Waits for any child processes to terminate or stop.
+ * Prints message to stderr if child process was stopped, signaled, or exited.
+ * @return: 0 if successful, -1 if error
+ *********************************************************************/
 static int ManageBackgroundProcesses(){
-    int child_status;
-    pid_t my_pid = getpid();
-    pid_t child_pid = waitpid(-my_pid, &child_status, WNOHANG); // Get any child with same group PID as smallsh.
+    int child_status; pid_t my_pid = getpid();
+    pid_t child_pid = waitpid(-my_pid, &child_status, WNOHANG | WUNTRACED); // Get any child with same group PID as smallsh.
     while (child_pid > 0) {
-        if (WIFEXITED(child_status)) {
-            if (fprintf(stderr, "Child process %jd done. Exit status %d\n", (intmax_t) child_pid,
-                        WEXITSTATUS(child_status)) < 0) goto exit;
-        } else if (WIFSIGNALED(child_status)) {
-            if (fprintf(stderr, "Child process %jd done. Terminated by signal %d\n", (intmax_t) child_pid,
-                        WTERMSIG(child_status)) < 0) goto exit;
-        } else if (WIFSTOPPED(child_status)) {
+        if (WIFSTOPPED(child_status)) {
             if (kill(child_pid, SIGCONT) < 0) goto exit;
             if (fprintf(stderr, "Child process %jd stopped. Continuing.\n", (intmax_t) child_pid)) goto exit;
         }
-        child_pid = waitpid(-my_pid, &child_status, 0);
+        else if (WIFSIGNALED(child_status)) {
+            if (fprintf(stderr, "Child process %jd done. Signaled %d.\n", (intmax_t) child_pid,
+                        WTERMSIG(child_status)) < 0)
+                goto exit;
+        }
+        else if (WIFEXITED(child_status)) {
+            if (fprintf(stderr, "Child process %jd done. Exit status %d.\n", (intmax_t) child_pid,
+                        WEXITSTATUS(child_status)) < 0) goto exit;
+        }
+        // Get next child
+        child_pid = waitpid(-my_pid, &child_status, WNOHANG | WUNTRACED);
+    }
+    exit:
+    return errno ? -1 : 0;
+}
+
+/*********************************************************************
+ * KillChildrenProcesses()
+ * Kills all child processes of parent_pid using Signal.
+ * Will not produce an error if there are no child processes.
+ * @param pid_t parent_pid
+ * @param int Signal
+ * @return: 0 if successful, -1 if error
+ *********************************************************************/
+int KillChildrenProcesses(pid_t parent_pid, int signal){
+    int child_status;
+    pid_t child_pid = waitpid(-parent_pid, &child_status, WNOHANG); // Get any child with same group PID as smallsh.
+    while (child_pid > 0) {
+        if (kill(child_pid, signal) < 0) goto exit;
+        // Get next child
+        child_pid = waitpid(-parent_pid, &child_status, WNOHANG);
     }
     exit:
     return errno ? -1 : 0;
