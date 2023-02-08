@@ -26,7 +26,7 @@
 
 // Struct to hold command line information
 typedef struct {
-    char *command_array[512];
+    char *command_array[MAX_LINE];
     int line_count;
     int is_background;
     int is_input_redirection;
