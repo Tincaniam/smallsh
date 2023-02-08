@@ -24,17 +24,25 @@
 
 #define MAX_LINE 512 /* The maximum length command */
 
-int dollar_question = 0;
-char *dollar_exclamation = "";
-int err_status = 0;
-int set_infile = 0; int set_outfile = 0;
-ssize_t line_count = 0;
-int is_background = 0;
+typedef struct {
+    char *command_array[512];
+    int line_count;
+    int is_background;
+    int is_input_redirection;
+    int is_output_redirection;
+    char in_file_name[256];
+    char out_file_name[256];
+    int err_status;
+    int dollar_question;
+    char *dollar_exclamation;
+} command;
 
-// User commands will be put in a big array of char *[] to be iterated through
-char *token_array[MAX_LINE] = {NULL};
-char in_file_name[256] = {0};
-char out_file_name[256] = {0};
+//int dollar_question = 0;
+//char *dollar_exclamation = "";
+//int err_status = 0;
+//int set_infile = 0; int set_outfile = 0;
+//ssize_t line_count = 0;
+//int is_background = 0;
 
 // Initialize SIGINT_action struct to be empty
 struct sigaction SIGINT_action = {0}, ignore_action = {0}, old_sigstp_action, old_sigint_action;
@@ -48,9 +56,9 @@ void handle_SIGINT_JUMP(){
 }
 
 // Function prototypes
-static int GetCommands(char *line, size_t len);
-static int ParseCommands();
-static int ExecuteCommands();
+static int GetCommands(command *cmd, char *line, size_t len);
+static int ParseCommands(command *cmd);
+static int ExecuteCommands(command *cmd);
 static int ManageBackgroundProcesses();
 int KillChildrenProcesses(pid_t parent_pid, int signal);
 char *str_gsub(char *restrict *restrict haystack, char const *restrict needle, char const *restrict sub);
@@ -60,6 +68,12 @@ char *str_gsub(char *restrict *restrict haystack, char const *restrict needle, c
  ********************************************************************************/
 int main(void) {
 
+//    char *cmd.command_array[MAX_LINE] = {NULL};
+//    char in_file_name[256] = {0};
+//    char out_file_name[256] = {0};
+
+    command cmd;
+
     // Declare line pointer outside of loop to avoid memory leak
     char *line = NULL;
     size_t len = 0;
@@ -67,25 +81,25 @@ int main(void) {
     for (;;) {
         // Clean up
         getcmd:
-        is_background = 0;
-        memset(token_array, 0, 512);
-        memset(in_file_name, 0, 256);
-        memset(out_file_name, 0, 256);
+        cmd.is_background = 0;
+        memset(cmd.command_array, 0, sizeof (cmd.command_array));
+        memset(cmd.in_file_name, 0, sizeof (cmd.in_file_name));
+        memset(cmd.out_file_name, 0, sizeof (cmd.out_file_name));
 
-        set_infile = 0; set_outfile = 0;
-        line_count = 0;
-        err_status = 0;
+        cmd.is_input_redirection = 0; cmd.is_output_redirection = 0;
+        cmd.line_count = 0;
+        cmd.err_status = 0;
 
-        GetCommands(line, len);
+        GetCommands(&cmd, line, len);
         if (feof(stdin)) goto exit;
-        if (token_array[0] == NULL){ // no command word
+        if (cmd.command_array[0] == NULL){ // no command word
             // Go back to get command
             goto getcmd;
         }
-        ParseCommands();
-        ExecuteCommands();
+        ParseCommands(&cmd);
+        ExecuteCommands(&cmd);
     } exit:
-    exit(dollar_question);
+    exit(cmd.dollar_question);
 }
 
 
@@ -137,7 +151,7 @@ char *str_gsub(char *restrict *restrict haystack, char const *restrict needle, c
  * @param size_t len
  * @return: 0 if successful, -1 if error
  *********************************************************************/
-static int GetCommands(char *line, size_t len) {
+static int GetCommands(command *cmd, char *line, size_t len) {
     ignore_action.sa_handler = SIG_IGN;
     // Fill out the SIGINT_action struct
     // Register handle_SIGINT as the signal handler
@@ -179,7 +193,7 @@ static int GetCommands(char *line, size_t len) {
     ssize_t line_length = getline(&line, &len, stdin); /* Reallocates line */
     if (feof(stdin)){
         fprintf(stderr, "\nexit\n");
-        exit(dollar_question);
+        exit(cmd->dollar_question);
     }
 
     if (line_length == 1) goto exit; // no command word
@@ -191,53 +205,53 @@ static int GetCommands(char *line, size_t len) {
         clearerr(stdin); // reset stdin status due to interrupt
         goto jump_point;
     }
-    // Process user input
+        // Process user input
     else {
         char *token;
         int i = 0;
         const char *sep = getenv("IFS");
         if (sep == NULL) sep = " \t\n";
-        // Make a copy of each word, store them in token_array for individual reallocation.
+        // Make a copy of each word, store them in cmd.command_array for individual reallocation.
         token = strtok(line, sep);
         char *token_copy = NULL;
         while (token != NULL && strcmp(token, "#") != 0) {
             token_copy = strdup(token);
-            token_array[i] = token_copy;
+            cmd->command_array[i] = token_copy;
             token = strtok(NULL, sep);
             i++;
-            line_count++;
+            cmd->line_count++;
         }
 
         // Check each token for variable expansion
         int k = 0;
-        while (token_array[k] != NULL && strcmp(token_array[k], "#") != 0) {
+        while (cmd->command_array[k] != NULL && strcmp(cmd->command_array[k], "#") != 0) {
             // get 2 first chars of token to compare for expansion
             char *first_chars = malloc(3);
             memset(first_chars, 0, 3);
-            first_chars[0] = token_array[k][0]; first_chars[1] = token_array[k][1];
+            first_chars[0] = cmd->command_array[k][0]; first_chars[1] = cmd->command_array[k][1];
             // Expand ~ to home directory
             if (strcmp(first_chars, "~/") == 0) {
                 char *home = getenv("HOME");
-                str_gsub(&token_array[k], "~", home);
+                str_gsub(&cmd->command_array[k], "~", home);
             }
 
             // Expand $$ to PID of smallsh
             pid_t pid = getpid();
             char *str_pid = malloc(21);
             if (sprintf(str_pid, "%jd", (intmax_t) pid) < 0) goto exit;
-            str_gsub(&token_array[k], "$$", str_pid);
+            str_gsub(&cmd->command_array[k], "$$", str_pid);
             free(str_pid);
 
             // Expand $? to exit status of last foreground command
             // The $? parameter shall default to 0 (“0”).
             char *dollar_question_str = malloc(11);
-            if (sprintf(dollar_question_str, "%d", dollar_question) < 0) goto exit;
-            str_gsub(&token_array[k], "$?", dollar_question_str);
+            if (sprintf(dollar_question_str, "%d", cmd->dollar_question) < 0) goto exit;
+            str_gsub(&cmd->command_array[k], "$?", dollar_question_str);
             free(dollar_question_str);
 
             //Expand $! to PID of most recent background process
             // The $! parameter shall default to an empty string (““) if no background process ID is available.
-            str_gsub(&token_array[k], "$!", dollar_exclamation);
+            str_gsub(&cmd->command_array[k], "$!", cmd->dollar_exclamation);
 
             k++;
         }
@@ -247,47 +261,48 @@ static int GetCommands(char *line, size_t len) {
 
 /*******************************************************************************
  * ParseCommands
- * Parse the commands in token_array and handle redirection and background processes
+ * Parse the commands in cmd.command_array and handle redirection and background processes
  * @return 0 if successful, -1 if error
  ********************************************************************************/
-static int ParseCommands(){
+static int ParseCommands(command *cmd) {
 
-    if (token_array[0] == NULL) goto exit;
-    ssize_t i = line_count; // i is the index of the last valid token
+    //if (cmd.command_array[0] == NULL) goto exit;
+    if (cmd->command_array[0] == NULL) return 0;
+    ssize_t i = cmd->line_count; // i is the index of the last valid token
     // Parse background indicator
-    if (token_array[i - 1] != NULL && strcmp(token_array[i - 1], "&") == 0) {
-        is_background = 1;
-        free(token_array[i - 1]);
-        token_array[i - 1] = NULL;
+    if (cmd->command_array[i - 1] != NULL && strcmp(cmd->command_array[i - 1], "&") == 0) {
+        cmd->is_background = 1;
+        free(cmd->command_array[i - 1]);
+        cmd->command_array[i - 1] = NULL;
         i--;
-        line_count--;
+        cmd->line_count--;
     }
     // Parse redirection
-    if (token_array[i - 1] != NULL && token_array[i - 2] != NULL) {
+    if (cmd->command_array[i - 1] != NULL && cmd->command_array[i - 2] != NULL) {
         // Need to loop through these options twice to make sure either order works
         for (int j = 0; j < 2; j++) {
             // Check for input redirection
-            if (set_infile == 0) { // Only set infile once
-                if (strcmp(token_array[i - 2], "<") == 0) {
-                    strcpy(in_file_name, token_array[i - 1]);
-                    free(token_array[i - 2]);
-                    token_array[i - 2] = NULL;
-                    token_array[i - 1] = NULL;
+            if (cmd->is_input_redirection == 0) { // Only set infile once
+                if (strcmp(cmd->command_array[i - 2], "<") == 0) {
+                    strcpy(cmd->in_file_name, cmd->command_array[i - 1]);
+                    free(cmd->command_array[i - 2]);
+                    cmd->command_array[i - 2] = NULL;
+                    cmd->command_array[i - 1] = NULL;
                     i -= 2;
-                    line_count -= 2;
-                    set_infile = 1;
+                    cmd->line_count -= 2;
+                    cmd->is_input_redirection = 1;
                 }
             }
             // Check for output redirection
-            if (set_outfile == 0) { // Only set outfile once
-                if (strcmp(token_array[i - 2], ">") == 0) {
-                    strcpy(out_file_name, token_array[i - 1]);
-                    free(token_array[i - 2]);
-                    token_array[i - 2] = NULL;
-                    token_array[i - 1] = NULL;
+            if (cmd->is_output_redirection == 0) { // Only set outfile once
+                if (strcmp(cmd->command_array[i - 2], ">") == 0) {
+                    strcpy(cmd->out_file_name, cmd->command_array[i - 1]);
+                    free(cmd->command_array[i - 2]);
+                    cmd->command_array[i - 2] = NULL;
+                    cmd->command_array[i - 1] = NULL;
                     i -= 2;
-                    line_count -= 2;
-                    set_outfile = 1;
+                    cmd->line_count -= 2;
+                    cmd->is_output_redirection = 1;
                 }
             }
         }
@@ -298,67 +313,67 @@ static int ParseCommands(){
 
 /*********************************************************************
  * ExecuteCommands
- * Execute the commands stored in token_array.
+ * Execute the commands stored in cmd.command_array.
  * Includes built-in commands: exit and cd.
  * Supports non-built in commands, and background processes.
  * Handles redirection.
  * @return: 0 if successful, -1 if error
  *********************************************************************/
-static int ExecuteCommands(){
+static int ExecuteCommands(command *cmd) {
 
-    if (token_array[0] == NULL) goto exit;
+    if (cmd->command_array[0] == NULL) goto exit;
 
     int child_status;
     pid_t my_pid = getpid();
-    pid_t child_pid = waitpid(-my_pid, &child_status, WNOHANG | WUNTRACED); // Get any child with same group PID as smallsh.
+    waitpid(-my_pid, &child_status, WNOHANG | WUNTRACED); // Get any child with same group PID as smallsh.
 
     // Built in commands
 
     // exit
-    if (strcmp(token_array[0], "exit") == 0) {
-        if (token_array[2] != NULL) { // too many arguments
+    if (strcmp(cmd->command_array[0], "exit") == 0) {
+        if (cmd->command_array[2] != NULL) { // too many arguments
             fprintf(stderr, "exit: too many arguments\n");
-            err_status = -1;
+            cmd->err_status = -1;
             goto exit;
         }
-        if (token_array[1] != NULL) { // exit argument
-            long exit_status = strtol(token_array[1], NULL, 10);
+        if (cmd->command_array[1] != NULL) { // exit argument
+            long exit_status = strtol(cmd->command_array[1], NULL, 10);
             if (exit_status > -256 && exit_status < 256){ // exit argument is an int
                 fprintf(stderr, "\nexit\n");
                 KillChildrenProcesses(my_pid, SIGINT);
-                err_status = (int) exit_status;
-                exit(err_status);
+                cmd->err_status = (int) exit_status;
+                exit(cmd->err_status);
             }
             else { // exit argument is not an int
                 fprintf(stderr, "exit: argument not an int\n");
-                err_status = -1;
+                cmd->err_status = -1;
                 goto exit;
             }
         }
         else { // no exit argument, exit with status of last foreground command
             fprintf(stderr, "\nexit\n");
             KillChildrenProcesses(my_pid, SIGINT);
-            exit(dollar_question);
+            exit(cmd->dollar_question);
         }
     }
 
     // cd
-    if (strcmp(token_array[0], "cd") == 0) {
-        if (token_array[2] != NULL) { // too many arguments
+    if (strcmp(cmd->command_array[0], "cd") == 0) {
+        if (cmd->command_array[2] != NULL) { // too many arguments
             fprintf(stderr, "smallsh: cd: too many arguments\n");
-            err_status = -1;
+            cmd->err_status = -1;
             goto exit;
         }
-        else if (token_array[1] == NULL) { // no argument, go to home directory
+        else if (cmd->command_array[1] == NULL) { // no argument, go to home directory
             if (chdir(getenv("HOME")) < 0) goto exit;
         }
         else { // argument, go to directory
-            if (chdir(token_array[1]) < 0) goto exit;
+            if (chdir(cmd->command_array[1]) < 0) goto exit;
         }
         goto exit;
     }
 
-    // Non-Built-in commands
+        // Non-Built-in commands
     else{
         // Using exec() with fork(), taken from Exploration: Process API - Executing a New Program
 
@@ -367,7 +382,7 @@ static int ExecuteCommands(){
         switch(spawn_pid){
             case -1:
                 perror("fork()\n");
-                err_status = -1;
+                cmd->err_status = -1;
                 goto exit;
             case 0:
                 // This runs in the child process.
@@ -378,11 +393,11 @@ static int ExecuteCommands(){
 
                 // Taken from Exploration: Processes and I/O
                 // File input
-                if (set_infile == 1){
+                if (cmd->is_input_redirection == 1){
                     // Open source file
-                    int source_file = open(in_file_name, O_RDONLY);
+                    int source_file = open(cmd->in_file_name, O_RDONLY);
                     if (source_file == -1){
-                        fprintf(stderr, "open() failed on \"%s\"\n", in_file_name);
+                        fprintf(stderr, "open() failed on \"%s\"\n", cmd->in_file_name);
                         exit(-1);
                     }
                     // Redirect stdin to source file
@@ -396,9 +411,9 @@ static int ExecuteCommands(){
                 }
 
                 // File output
-                if (set_outfile == 1) {
+                if (cmd->is_output_redirection == 1) {
                     // Open target file
-                    int target_file = open(out_file_name, O_WRONLY | O_CREAT | O_TRUNC, 0777);
+                    int target_file = open(cmd->out_file_name, O_WRONLY | O_CREAT | O_TRUNC, 0777);
                     if (target_file == -1) {
                         perror("target open()");
                         exit(-1);
@@ -411,19 +426,19 @@ static int ExecuteCommands(){
                     }
                 }
                 // Replace the current process image with a new process image
-                execvp(token_array[0], token_array);
+                execvp(cmd->command_array[0], cmd->command_array);
 
                 //Check for "/" in first character of command
-                char first_char[1] = {};
-                first_char[0] = token_array[0][0];
+                char first_char[1];
+                first_char[0] = cmd->command_array[0][0];
                 if (strcmp(first_char, "/") != 0){
                     // Search for command in PATH
-                    execvp(token_array[0], token_array);
+                    execvp(cmd->command_array[0], cmd->command_array);
                 }
                 else{
                     // Search for command in current directory
                     // Search for command in PATH
-                    execv(token_array[0], token_array);
+                    execv(cmd->command_array[0], cmd->command_array);
                 }
                 // exec only returns if there is an error
                 perror("execve");
@@ -431,25 +446,25 @@ static int ExecuteCommands(){
             default:
                 // In the parent process
                 // If not background, blocking wait for child's termination
-                if (is_background == 0){
+                if (cmd->is_background == 0){
                     // Wait for child process to terminate
                     spawn_pid = waitpid(spawn_pid, &child_status, WUNTRACED);
-                    dollar_question = child_status;
+                    cmd->dollar_question = child_status;
                     if (WIFEXITED(child_status)){
-                        dollar_question = WEXITSTATUS(child_status);
+                        cmd->dollar_question = WEXITSTATUS(child_status);
                     }
-                    // If child process was terminated by a signal, set $? to 128 + signal number
+                        // If child process was terminated by a signal, set $? to 128 + signal number
                     else if (WIFSIGNALED(child_status)){
                         //fprintf(stderr, "terminated by signal %d\n", WTERMSIG(child_status));
-                        dollar_question = 128 + WTERMSIG(child_status);
+                        cmd->dollar_question = 128 + WTERMSIG(child_status);
                     }
-                    // If child process was stopped by a signal, send SIGCONT to child process
-                    // set $! to child process ID. Print message to stderr.
+                        // If child process was stopped by a signal, send SIGCONT to child process
+                        // set $! to child process ID. Print message to stderr.
                     else if (WIFSTOPPED(child_status)) {
                         if (kill(spawn_pid, SIGCONT) < 0) goto exit;
                         if (fprintf(stderr, "Child process %jd stopped. Continuing.\n", (intmax_t) spawn_pid) < 0) goto exit;
-                        dollar_exclamation = malloc(21);
-                        if (sprintf(dollar_exclamation, "%jd", (intmax_t) spawn_pid) < 0) goto exit;
+                        cmd->dollar_exclamation = malloc(21);
+                        if (sprintf(cmd->dollar_exclamation, "%jd", (intmax_t) spawn_pid) < 0) goto exit;
                         goto background_process;
                     }
                     goto exit;
@@ -457,14 +472,14 @@ static int ExecuteCommands(){
                 else {
                     background_process:
                     waitpid(spawn_pid, &child_status, WNOHANG);
-                    dollar_exclamation = malloc(21);
-                    if (sprintf(dollar_exclamation, "%jd", (intmax_t) spawn_pid) < 0) goto exit;
+                    cmd->dollar_exclamation = malloc(21);
+                    if (sprintf(cmd->dollar_exclamation, "%jd", (intmax_t) spawn_pid) < 0) goto exit;
                     goto exit;
                 }
         }
     }
     exit:
-    return err_status;
+    return cmd->err_status;
 }
 
 /*********************************************************************
