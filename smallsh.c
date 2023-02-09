@@ -21,12 +21,13 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <fcntl.h>
+#include <ctype.h>
 
 #define MAX_LINE 512 /* The maximum length command */
 
 // Struct to hold command line information
 typedef struct {
-    char *command_array[MAX_LINE];
+    char *command_array[512];
     int line_count;
     int is_background;
     int is_input_redirection;
@@ -53,8 +54,11 @@ void handle_SIGINT_JUMP(){
 
 // Function prototypes
 static int GetCommands(command *cmd, char *line, size_t len);
+static int ExpandVariables(command *cmd);
 static int ParseCommands(command *cmd);
 static int ExecuteCommands(command *cmd);
+static int ExitShell(command *cmd, pid_t pid);
+static int ChangeDirectory(command *cmd);
 static int ManageBackgroundProcesses();
 int KillChildrenProcesses(pid_t parent_pid, int signal);
 char *str_gsub(char *restrict *restrict haystack, char const *restrict needle, char const *restrict sub);
@@ -178,7 +182,7 @@ static int GetCommands(command *cmd, char *line, size_t len) {
     if (ps1 == NULL) ps1 = "";
 
     // Print prompt message
-    if (printf("%s", ps1) < 0) goto exit;
+    if (fprintf(stderr, "%s", ps1) < 0) goto exit;
     fflush(stdout);
 
     // Get user input
@@ -206,6 +210,7 @@ static int GetCommands(command *cmd, char *line, size_t len) {
         // Make a copy of each word, store them in cmd.command_array for individual reallocation.
         token = strtok(line, sep);
         char *token_copy = NULL;
+        // Store each token in cmd.command_array until # is reached.
         while (token != NULL && strcmp(token, "#") != 0) {
             token_copy = strdup(token);
             cmd->command_array[i] = token_copy;
@@ -214,38 +219,54 @@ static int GetCommands(command *cmd, char *line, size_t len) {
             cmd->line_count++;
         }
 
-        // Check each token for variable expansion
-        int k = 0;
-        while (cmd->command_array[k] != NULL && strcmp(cmd->command_array[k], "#") != 0) {
-            // get 2 first chars of token to compare for expansion
-            char *first_chars = malloc(3);
-            memset(first_chars, 0, 3);
-            first_chars[0] = cmd->command_array[k][0]; first_chars[1] = cmd->command_array[k][1];
-            // Expand ~ to home directory
-            if (strcmp(first_chars, "~/") == 0) {
-                char *home = getenv("HOME");
-                str_gsub(&cmd->command_array[k], "~", home);
-            }
+        // Expand variables
+        ExpandVariables(cmd);
 
-            // Expand $$ to PID of smallsh
-            pid_t pid = getpid();
-            char *str_pid = malloc(21);
-            if (sprintf(str_pid, "%jd", (intmax_t) pid) < 0) goto exit;
-            str_gsub(&cmd->command_array[k], "$$", str_pid);
-            free(str_pid);
-
-            // Expand $? to exit status of last foreground command
-            char *dollar_question_str = malloc(11);
-            if (sprintf(dollar_question_str, "%d", dollar_question) < 0) goto exit;
-            str_gsub(&cmd->command_array[k], "$?", dollar_question_str);
-            free(dollar_question_str);
-
-            //Expand $! to PID of most recent background process
-            str_gsub(&cmd->command_array[k], "$!", dollar_exclamation);
-
-            k++;
-        }
     } exit:
+    return errno ? -1 : 0;
+}
+
+/*******************************************************************************
+ * ExpandVariables
+ * Expand variables in command array
+ * @param command* cmd
+ * @return 0 if successful, -1 if error
+ ********************************************************************************/
+static int ExpandVariables(command *cmd) {
+    // Check each token for variable expansion
+    int i = 0;
+    while (cmd->command_array[i] != NULL && strcmp(cmd->command_array[i], "#") != 0) {
+        // get 2 first chars of token to compare for expansion
+        char *first_chars = malloc(3);
+        memset(first_chars, 0, 3);
+        first_chars[0] = cmd->command_array[i][0];
+        first_chars[1] = cmd->command_array[i][1];
+
+        // Expand ~ to home directory
+        if (strcmp(first_chars, "~/") == 0) {
+            char *home = getenv("HOME");
+            str_gsub(&cmd->command_array[i], "~", home);
+        }
+
+        // Expand $$ to PID of smallsh
+        pid_t pid = getpid();
+        char *str_pid = malloc(21);
+        if (sprintf(str_pid, "%jd", (intmax_t) pid) < 0) goto exit;
+        str_gsub(&cmd->command_array[i], "$$", str_pid);
+        free(str_pid);
+
+        // Expand $? to exit status of last foreground command
+        char *dollar_question_str = malloc(11);
+        if (sprintf(dollar_question_str, "%d", dollar_question) < 0) goto exit;
+        str_gsub(&cmd->command_array[i], "$?", dollar_question_str);
+        free(dollar_question_str);
+
+        //Expand $! to PID of most recent background process
+        str_gsub(&cmd->command_array[i], "$!", dollar_exclamation);
+
+        i++;
+    }
+    exit:
     return errno ? -1 : 0;
 }
 
@@ -319,47 +340,16 @@ static int ExecuteCommands(command *cmd) {
 
     // Built in commands
     if (cmd->command_array[0] == NULL) goto exit;
+
     // exit
     if (strcmp(cmd->command_array[0], "exit") == 0) {
-        if (cmd->command_array[2] != NULL) { // too many arguments
-            fprintf(stderr, "exit: too many arguments\n");
-            err_status = -1;
-            goto exit;
-        }
-        if (cmd->command_array[1] != NULL) { // exit argument
-            long exit_status = strtol(cmd->command_array[1], NULL, 10);
-            if (exit_status > -256 && exit_status < 256){ // exit argument is an int
-                fprintf(stderr, "\nexit\n");
-                KillChildrenProcesses(my_pid, SIGINT);
-                err_status = (int) exit_status;
-                exit(err_status);
-            }
-            else { // exit argument is not an int
-                fprintf(stderr, "exit: argument not an int\n");
-                err_status = -1;
-                goto exit;
-            }
-        }
-        else { // no exit argument, exit with status of last foreground command
-            fprintf(stderr, "\nexit\n");
-            KillChildrenProcesses(my_pid, SIGINT);
-            exit(dollar_question);
-        }
+        err_status = (ExitShell(cmd, my_pid) < 0) ? -1 : 0;
+        goto exit;
     }
 
     // cd
     if (strcmp(cmd->command_array[0], "cd") == 0) {
-        if (cmd->command_array[2] != NULL) { // too many arguments
-            fprintf(stderr, "smallsh: cd: too many arguments\n");
-            err_status = -1;
-            goto exit;
-        }
-        else if (cmd->command_array[1] == NULL) { // no argument, go to home directory
-            if (chdir(getenv("HOME")) < 0) goto exit;
-        }
-        else { // argument, go to directory
-            if (chdir(cmd->command_array[1]) < 0) goto exit;
-        }
+        err_status = (ChangeDirectory(cmd) < 0) ? -1 : 0;
         goto exit;
     }
 
@@ -415,21 +405,10 @@ static int ExecuteCommands(command *cmd) {
                         exit(-1);
                     }
                 }
+
                 // Replace the current process image with a new process image
                 execvp(cmd->command_array[0], cmd->command_array);
 
-                //Check for "/" in first character of command
-                char first_char[1];
-                first_char[0] = cmd->command_array[0][0];
-                if (strcmp(first_char, "/") != 0){
-                    // Search for command in PATH
-                    execvp(cmd->command_array[0], cmd->command_array);
-                }
-                else{
-                    // Search for command in current directory
-                    // Search for command in PATH
-                    execv(cmd->command_array[0], cmd->command_array);
-                }
                 // exec only returns if there is an error
                 perror("execve");
                 exit(-1);
@@ -465,6 +444,73 @@ static int ExecuteCommands(command *cmd) {
                     if (sprintf(dollar_exclamation, "%jd", (intmax_t) spawn_pid) < 0) goto exit;
                     goto exit;
                 }
+        }
+    }
+    exit:
+    return err_status;
+}
+
+/*********************************************************************
+ * ExitShell()
+ * Handles exit command.
+ * If exit argument is an int, exits with that status.
+ * If exit argument is not an int, prints error message to stderr.
+ * If exit argument is not given, exits with status 0.
+ * Kills all child processes before exiting.
+ * @return: 0 if successful, -1 if error
+ *********************************************************************/
+static int ExitShell(command *cmd, pid_t my_pid){
+    if (cmd->command_array[2] != NULL) { // too many arguments
+        fprintf(stderr, "exit: too many arguments\n");
+        goto exit;
+    }
+    if (cmd->command_array[1] != NULL) { // exit argument
+        // Check if exit argument is an int
+        for (size_t i = 0; i < strlen(cmd->command_array[1]); i++){
+            if (isdigit(cmd->command_array[1][i]) == 0){
+                fprintf(stderr, "exit: argument not an int\n");
+                goto exit;
+            }
+        }
+        // Convert exit argument to int
+        long exit_status = strtol(cmd->command_array[1], NULL, 10);
+        fprintf(stderr, "\nexit\n");
+        KillChildrenProcesses(my_pid, SIGINT);
+        int err_status = (int) exit_status;
+        exit(err_status);
+    }
+    else { // no exit argument, exit with status of last foreground command
+        fprintf(stderr, "\nexit\n");
+        KillChildrenProcesses(my_pid, SIGINT);
+        exit(dollar_question);
+    }
+    exit:
+    return -1;
+}
+
+/*********************************************************************
+ * ManageBackgroundProcesses()
+ * Waits for any child processes to terminate or stop.
+ * Prints message to stderr if child process was stopped, signaled, or exited.
+ * @return: 0 if successful, -1 if error
+ *********************************************************************/
+static int ChangeDirectory(command *cmd){
+    int err_status = 0;
+    if (cmd->command_array[2] != NULL) { // too many arguments
+        fprintf(stderr, "smallsh: cd: too many arguments\n");
+        err_status = -1;
+        goto exit;
+    }
+    else if (cmd->command_array[1] == NULL) { // no argument, go to home directory
+        if (chdir(getenv("HOME")) < 0) {
+            err_status = -1;
+            goto exit;
+        }
+    }
+    else { // argument, go to directory
+        if (chdir(cmd->command_array[1]) < 0) {
+            err_status = -1;
+            goto exit;
         }
     }
     exit:
