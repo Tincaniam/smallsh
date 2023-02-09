@@ -100,7 +100,7 @@ int main(void) {
 
 /*****************************************************************
  * char *str_gsub
- * Taken from String search and replace tutorial by Ryan Gambord
+ * Replace all occurrences of a substring in a string.
  * @param char* haystack
  * @param char* needle
  * @param char* sub
@@ -355,7 +355,7 @@ static int ExecuteCommands(command *cmd) {
 
     // Non-Built-in commands
     else{
-        // Using exec() with fork(), taken from Exploration: Process API - Executing a New Program
+        // Using exec() with fork()
 
         // Fork a new process
         pid_t spawn_pid = fork();
@@ -371,7 +371,6 @@ static int ExecuteCommands(command *cmd) {
                 sigaction(SIGTSTP, &old_sigstp_action, NULL);
                 sigaction(SIGINT, &old_sigint_action, NULL);
 
-                // Taken from Exploration: Processes and I/O
                 // File input
                 if (cmd->is_input_redirection == 1){
                     // Open source file
@@ -457,7 +456,9 @@ static int ExecuteCommands(command *cmd) {
  * If exit argument is not an int, prints error message to stderr.
  * If exit argument is not given, exits with status 0.
  * Kills all child processes before exiting.
- * @return: 0 if successful, -1 if error
+ * @param: command *cmd - command struct
+ * @param: pid_t my_pid - PID of smallsh
+ * @return: -1 if error, otherwise exits shell.
  *********************************************************************/
 static int ExitShell(command *cmd, pid_t my_pid){
     if (cmd->command_array[2] != NULL) { // too many arguments
@@ -489,9 +490,12 @@ static int ExitShell(command *cmd, pid_t my_pid){
 }
 
 /*********************************************************************
- * ManageBackgroundProcesses()
- * Waits for any child processes to terminate or stop.
- * Prints message to stderr if child process was stopped, signaled, or exited.
+ * ChangeDirectory()
+ * Handles cd command.
+ * If no argument, changes directory to home directory.
+ * If argument, changes directory to argument.
+ * If too many arguments, prints error message to stderr.
+ * @param cmd: command struct
  * @return: 0 if successful, -1 if error
  *********************************************************************/
 static int ChangeDirectory(command *cmd){
